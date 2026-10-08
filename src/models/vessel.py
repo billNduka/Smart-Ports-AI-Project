@@ -12,9 +12,7 @@ class Vessel:
     size: float  # Length or tonnage
     cargo_type: str  # e.g., 'container', 'bulk', 'tanker'
     handling_time: float  # Unloading/loading time in hours
-    coordinates: Tuple[float, float]  # (Latitude, Longitude) for map tracking
-    priority: int = 1  # Optional priority tier (1 = default)
-
+    
     def is_compatible_with_berth(
         self, berth_capacity: float, supported_cargos: list[str]
     ) -> bool:

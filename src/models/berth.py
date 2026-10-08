@@ -10,7 +10,6 @@ class Berth:
     berth_id: str
     capacity: float  # Maximum vessel size accommodated
     compatible_cargo_types: List[str]  # Supported cargo types
-    coordinates: Tuple[float, float]  # Static (Latitude, Longitude) location
     available_from: datetime = field(default_factory=datetime.now)
 
     def can_accommodate(self, vessel_size: float, cargo_type: str) -> bool:
