@@ -37,7 +37,6 @@ class IoTSimulator:
             size = round(random.uniform(20.0, 150.0), 2)
             handling_time = round(random.uniform(2.0, 8.0), 2)
             cargo = random.choice(self.cargo_types)
-            priority = random.randint(1, 3)
             
             # Instantiate the Domain Model (Coordinates removed)
             vessel = Vessel(
@@ -45,8 +44,7 @@ class IoTSimulator:
                 arrival_time=current_time,
                 size=size,
                 cargo_type=cargo,
-                handling_time=handling_time,
-                priority=priority
+                handling_time=handling_time
             )
             
             vessels.append(vessel)

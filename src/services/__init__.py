@@ -1,3 +1,3 @@
-from src.services import DataSimulator
+from src.services.data_simulator import IoTSimulator
 
-__all__ = ["DataSimulator"]
+__all__ = ["IoTSimulator"]
