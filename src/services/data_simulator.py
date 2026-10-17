@@ -1,78 +1,62 @@
 import random
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
+
 from src.models import Vessel, Berth
+
+# Fixed simulation clock: makes every run reproducible (no datetime.now()).
+DEFAULT_START = datetime(2026, 10, 15, 18, 0, 0)
+
 
 class IoTSimulator:
     """Simulates IoT data streams for arriving vessels and static port berths."""
-    
+
     def __init__(self, seed: int = 42):
-        """
-        Initializes the simulator with a fixed random seed (Task 2.4).
-        Ensures scenarios are reproducible so both schedulers are tested fairly.
-        """
         self.seed = seed
-        random.seed(self.seed)
-        
-        # Cargo types strictly based on the thesis constraints
+        self.rng = random.Random(seed)  # isolated RNG (same sequence as random.seed(seed))
         self.cargo_types = ['Container', 'Bulk', 'Liquid', 'Ro-Ro', 'General']
 
-    def generate_vessels(self, num_vessels: int, arrival_rate_per_hour: float = 2.0, start_time: datetime = None) -> List[Vessel]:
-        """
-        Generates a list of mock vessels using an exponential inter-arrival distribution.
-        (Task 2.2)
-        """
-        if start_time is None:
-            start_time = datetime.now()
-            
-        vessels = []
-        current_time = start_time
-        
+    def generate_vessels(self, num_vessels: int, arrival_rate_per_hour: float = 2.0,
+                         start_time: Optional[datetime] = None) -> List[Vessel]:
+        """Poisson arrivals (exponential inter-arrival times), quantized to whole
+        minutes; handling times are whole minutes too, so both schedulers see
+        identical, exactly representable data."""
+        start_time = start_time or DEFAULT_START
+        vessels, clock_min = [], 0.0
         for i in range(1, num_vessels + 1):
-            # Poisson process arrival (Exponential inter-arrival time)
-            inter_arrival_hours = random.expovariate(arrival_rate_per_hour)
-            current_time += timedelta(hours=inter_arrival_hours)
-            
-            # Apply thesis parameter constraints
-            size = round(random.uniform(20.0, 150.0), 2)
-            handling_time = round(random.uniform(2.0, 8.0), 2)
-            cargo = random.choice(self.cargo_types)
-            
-            # Instantiate the Domain Model (Coordinates removed)
-            vessel = Vessel(
+            clock_min += self.rng.expovariate(arrival_rate_per_hour) * 60.0
+            size = round(self.rng.uniform(20.0, 150.0), 2)
+            handling_min = round(self.rng.uniform(2.0, 8.0) * 60.0)
+            cargo = self.rng.choice(self.cargo_types)
+            vessels.append(Vessel(
                 vessel_id=f"VESSEL-{i:03d}",
-                arrival_time=current_time,
+                arrival_time=start_time + timedelta(minutes=round(clock_min)),
                 size=size,
                 cargo_type=cargo,
-                handling_time=handling_time
-            )
-            
-            vessels.append(vessel)
-            
+                handling_time=handling_min / 60.0,
+            ))
         return vessels
 
-    def generate_berths(self, num_berths: int) -> List[Berth]:
-        """
-        Generates a static list of port berths with varying capacities.
-        (Task 2.3)
-        """
+    def generate_berths(self, num_berths: int, start_time: Optional[datetime] = None,
+                        ensure_coverage: bool = False) -> List[Berth]:
+        """ensure_coverage=True guarantees every cargo type has at least one berth
+        that can take the largest vessel (150), so no vessel is rejected just
+        because of the random berth draw."""
+        start_time = start_time or DEFAULT_START
         berths = []
-        
         for i in range(1, num_berths + 1):
-            # Thesis constraint: Capacities between 50 and 200
-            capacity = round(random.uniform(50.0, 200.0), 2)
-            
-            # Randomly assign 1 to 3 compatible cargo types to each berth
-            compatible_cargos = random.sample(self.cargo_types, random.randint(1, 3))
-            
-            # Instantiate the Domain Model (Coordinates removed)
-            berth = Berth(
-                berth_id=f"BERTH-{i:02d}",
-                capacity=capacity,
-                compatible_cargo_types=compatible_cargos,
-                available_from=datetime.now() # Initially available right now
-            )
-            
-            berths.append(berth)
-            
+            capacity = round(self.rng.uniform(50.0, 200.0), 2)
+            cargos = self.rng.sample(self.cargo_types, self.rng.randint(1, 3))
+            berths.append(Berth(berth_id=f"BERTH-{i:02d}", capacity=capacity,
+                                compatible_cargo_types=cargos, available_from=start_time))
+        if ensure_coverage and berths:
+            # Every cargo type gets at least one berth that handles it AND is
+            # large enough for the biggest vessel (150), so no ship is rejected
+            # purely because of the random berth draw.
+            for cargo in self.cargo_types:
+                if not any(cargo in b.compatible_cargo_types and b.capacity >= 150.0 for b in berths):
+                    target = berths[self.rng.randrange(len(berths))]
+                    if cargo not in target.compatible_cargo_types:
+                        target.compatible_cargo_types = list(target.compatible_cargo_types) + [cargo]
+                    target.capacity = max(target.capacity, 150.0)
         return berths

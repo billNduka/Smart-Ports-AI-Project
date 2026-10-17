@@ -1,3 +1,4 @@
+import copy
 import math
 from typing import List
 from datetime import datetime, timedelta
@@ -5,127 +6,122 @@ from ortools.sat.python import cp_model
 
 from src.models import Vessel, Berth, Assignment
 from src.services.schedulers.base_scheduler import BaseScheduler
+from src.services.schedulers.fcfs_scheduler import FCFSScheduler
+
 
 class AIScheduler(BaseScheduler):
     """
-    Implements AI-optimized scheduling logic using Google OR-Tools (CP-SAT Solver) 
-    to minimize the total wait time of all vessels subject to capacity constraints.
+    AI-optimized scheduling using Google OR-Tools CP-SAT.
+    Minimizes total vessel waiting time subject to berth compatibility,
+    one-berth-per-vessel, berth availability and non-overlap constraints.
+
+    Changes vs. first version:
+      * Time conversion uses ceil() for arrivals / berth availability and
+        round() for handling time, so no vessel can start before it arrives
+        and no service time is silently shortened.
+      * The FCFS schedule is supplied to the solver as a starting hint, so
+        the result is never worse than FCFS even if the time limit is hit.
+      * Solver status and solve time are exposed for reporting.
     """
+
+    def __init__(self, time_limit_seconds: float = 30.0):
+        self.time_limit_seconds = time_limit_seconds
+        self.last_status = "n/a"
+        self.last_solve_seconds = 0.0
+
+    @staticmethod
+    def _minutes(dt: datetime, base: datetime) -> int:
+        return math.ceil((dt - base).total_seconds() / 60.0 - 1e-9)
 
     def schedule(self, vessels: List[Vessel], berths: List[Berth]) -> List[Assignment]:
         if not vessels or not berths:
             return []
 
         model = cp_model.CpModel()
-
-        # 1. Time Normalization
-        # The OR-Tools solver strictly requires integers. We establish a "base time" (T=0)
-        # and convert all datetimes and durations into discrete integers (minutes).
         base_time = min(
-            min((v.arrival_time for v in vessels), default=datetime.max),
-            min((b.available_from for b in berths), default=datetime.max)
+            min(v.arrival_time for v in vessels),
+            min(b.available_from for b in berths),
         )
 
-        # Calculate a safe mathematical horizon (the maximum possible time needed if all ships queue at one berth)
-        max_arrival_min = max(int((v.arrival_time - base_time).total_seconds() // 60) for v in vessels)
-        max_berth_min = max(int((b.available_from - base_time).total_seconds() // 60) for b in berths)
-        total_handling_min = sum(int(v.handling_time * 60) for v in vessels)
-        horizon = int(max(max_arrival_min, max_berth_min) + total_handling_min + 1440) # 24hr buffer added
+        arr = {v.vessel_id: self._minutes(v.arrival_time, base_time) for v in vessels}
+        dur = {v.vessel_id: round(v.handling_time * 60.0) for v in vessels}
+        avail = {b.berth_id: max(0, self._minutes(b.available_from, base_time)) for b in berths}
 
-        # 2. Variable Storage
-        starts = {}
-        ends = {}
-        presences = {}
-        intervals = {}
-        wait_times = []
+        horizon = int(max(max(arr.values()), max(avail.values())) + sum(dur.values()) + 1440)
+
+        # Warm start: the FCFS schedule (a valid feasible solution)
+        fcfs_hint = {
+            a.vessel_id: (a.berth_id, self._minutes(a.start_time, base_time))
+            for a in FCFSScheduler().schedule(vessels, copy.deepcopy(berths))
+        }
+
+        starts, ends, presences, intervals, wait_times = {}, {}, {}, {}, []
 
         for v in vessels:
-            v_arrival_min = int((v.arrival_time - base_time).total_seconds() // 60)
-            v_handling_min = int(v.handling_time * 60)
-            
-            # Master start and end time variables for this specific vessel
-            start_var = model.NewIntVar(v_arrival_min, horizon, f"start_{v.vessel_id}")
-            end_var = model.NewIntVar(v_arrival_min + v_handling_min, horizon, f"end_{v.vessel_id}")
-            
-            # The wait time is the difference between when it docks (start_var) and when it arrived
+            a_min, d_min = arr[v.vessel_id], dur[v.vessel_id]
+            start_var = model.NewIntVar(a_min, horizon, f"start_{v.vessel_id}")
+            end_var = model.NewIntVar(a_min + d_min, horizon, f"end_{v.vessel_id}")
             wait_var = model.NewIntVar(0, horizon, f"wait_{v.vessel_id}")
-            model.Add(wait_var == start_var - v_arrival_min)
+            model.Add(wait_var == start_var - a_min)
             wait_times.append(wait_var)
-            
-            starts[v.vessel_id] = start_var
-            ends[v.vessel_id] = end_var
-            
-            vessel_berth_presences = []
-            
+            starts[v.vessel_id], ends[v.vessel_id] = start_var, end_var
+
+            hint_berth, hint_start = fcfs_hint.get(v.vessel_id, (None, None))
+            if hint_start is not None:
+                model.AddHint(start_var, hint_start)
+                model.AddHint(end_var, hint_start + d_min)
+
+            presence_list = []
             for b in berths:
-                # 3. Constraint: Physical Capacity & Cargo Matching
-                if v.is_compatible_with_berth(b.capacity, b.compatible_cargo_types):
-                    b_avail_min = int((b.available_from - base_time).total_seconds() // 60)
-                    
-                    # Boolean variable (1 if vessel docks here, 0 if not)
-                    presence_var = model.NewBoolVar(f"presence_{v.vessel_id}_{b.berth_id}")
-                    presences[(v.vessel_id, b.berth_id)] = presence_var
-                    vessel_berth_presences.append(presence_var)
-                    
-                    # Optional interval strictly enforced if the solver sets presence_var to 1
-                    opt_start = model.NewIntVar(v_arrival_min, horizon, f"opt_start_{v.vessel_id}_{b.berth_id}")
-                    opt_end = model.NewIntVar(v_arrival_min + v_handling_min, horizon, f"opt_end_{v.vessel_id}_{b.berth_id}")
-                    opt_interval = model.NewOptionalIntervalVar(
-                        opt_start, v_handling_min, opt_end, presence_var, f"opt_int_{v.vessel_id}_{b.berth_id}"
-                    )
-                    
-                    intervals.setdefault(b.berth_id, []).append(opt_interval)
-                    
-                    # Link the global start/end to this berth's optional start/end if selected
-                    model.Add(start_var == opt_start).OnlyEnforceIf(presence_var)
-                    model.Add(end_var == opt_end).OnlyEnforceIf(presence_var)
-                    
-                    # Constraint: The ship cannot dock before the berth is actually empty
-                    model.Add(opt_start >= b_avail_min).OnlyEnforceIf(presence_var)
-            
-            # Constraint: A vessel must be assigned to EXACTLY one compatible berth
-            if vessel_berth_presences:
-                model.AddExactlyOne(vessel_berth_presences)
-        
-        # 4. Constraint: Non-Overlap
-        # Ensures no two vessels can occupy the same berth at the same exact time
+                if not v.is_compatible_with_berth(b.capacity, b.compatible_cargo_types):
+                    continue
+                pres = model.NewBoolVar(f"presence_{v.vessel_id}_{b.berth_id}")
+                presences[(v.vessel_id, b.berth_id)] = pres
+                presence_list.append(pres)
+
+                o_start = model.NewIntVar(a_min, horizon, f"os_{v.vessel_id}_{b.berth_id}")
+                o_end = model.NewIntVar(a_min + d_min, horizon, f"oe_{v.vessel_id}_{b.berth_id}")
+                interval = model.NewOptionalIntervalVar(
+                    o_start, d_min, o_end, pres, f"oi_{v.vessel_id}_{b.berth_id}"
+                )
+                intervals.setdefault(b.berth_id, []).append(interval)
+
+                model.Add(start_var == o_start).OnlyEnforceIf(pres)
+                model.Add(end_var == o_end).OnlyEnforceIf(pres)
+                model.Add(o_start >= avail[b.berth_id]).OnlyEnforceIf(pres)
+
+                chosen = hint_berth == b.berth_id
+                model.AddHint(pres, 1 if chosen else 0)
+                model.AddHint(o_start, hint_start if chosen else a_min)
+                model.AddHint(o_end, (hint_start + d_min) if chosen else a_min + d_min)
+
+            if presence_list:
+                model.AddExactlyOne(presence_list)
+
         for b in berths:
             if b.berth_id in intervals:
                 model.AddNoOverlap(intervals[b.berth_id])
-                
-        # 5. Objective Function: Minimize Total Wait Time
+
         model.Minimize(sum(wait_times))
-        
-        # 6. Execute Solver
+
         solver = cp_model.CpSolver()
-        # Optional: Limit search time in case of massive data sets
-        solver.parameters.max_time_in_seconds = 30.0 
+        solver.parameters.max_time_in_seconds = self.time_limit_seconds
         status = solver.Solve(model)
-        
-        # 7. Extract Results back into Object-Oriented Domain Models
-        assignments = []
+        self.last_status = solver.StatusName(status)
+        self.last_solve_seconds = solver.WallTime()
+
+        assignments: List[Assignment] = []
         if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             for v in vessels:
                 for b in berths:
-                    if (v.vessel_id, b.berth_id) in presences:
-                        # Check if the AI chose this specific vessel-berth combination
-                        if solver.Value(presences[(v.vessel_id, b.berth_id)]):
-                            # Convert integer minutes back to Python datetimes
-                            final_start_min = solver.Value(starts[v.vessel_id])
-                            final_end_min = solver.Value(ends[v.vessel_id])
-                            
-                            start_time = base_time + timedelta(minutes=final_start_min)
-                            end_time = base_time + timedelta(minutes=final_end_min)
-                            
-                            assignment = Assignment(
+                    key = (v.vessel_id, b.berth_id)
+                    if key in presences and solver.Value(presences[key]):
+                        assignments.append(
+                            Assignment(
                                 vessel_id=v.vessel_id,
                                 berth_id=b.berth_id,
-                                start_time=start_time,
-                                end_time=end_time
+                                start_time=base_time + timedelta(minutes=solver.Value(starts[v.vessel_id])),
+                                end_time=base_time + timedelta(minutes=solver.Value(ends[v.vessel_id])),
                             )
-                            assignments.append(assignment)
-                            
-                            # Update the berth object for accurate metric tracking later
-                            b.available_from = end_time
-
+                        )
         return assignments
